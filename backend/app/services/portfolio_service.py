@@ -1,5 +1,5 @@
 from collections import defaultdict
-from datetime import timedelta
+from datetime import date, timedelta
 
 from app.models.holding import Holding
 from app.schemas.api_schemas import (
@@ -105,10 +105,18 @@ class PortfolioService:
 
     @classmethod
     def summarize(cls, lots: list[Holding]) -> PortfolioSummaryOut:
+        today = date.today()
+        fy_end_year = today.year if today <= date(today.year, 3, 31) else today.year + 1
+        fy_end = date(fy_end_year, 3, 31)
+
         total_value = 0.0
         total_unrealized_gain = 0.0
-        ltcg_eligible_value = 0.0
-        stcg_value = 0.0
+        lt_unrealized_profit_net = 0.0
+        st_unrealized_profit_net = 0.0
+        st_turns_lt_by_fy_end_net = 0.0
+        st_turns_lt_by_fy_end_positive = 0.0
+        lt_bookable_gain_positive = 0.0
+        st_bookable_gain_positive = 0.0
         by_broker: dict[str, float] = {}
 
         for lot in lots:
@@ -118,44 +126,125 @@ class PortfolioService:
             total_unrealized_gain += ug
             by_broker[lot.broker] = by_broker.get(lot.broker, 0.0) + mv
             if cls._is_lt(lot):
-                ltcg_eligible_value += mv
+                lt_unrealized_profit_net += ug
+                lt_bookable_gain_positive += max(0.0, ug)
             else:
-                stcg_value += mv
+                st_unrealized_profit_net += ug
+                st_bookable_gain_positive += max(0.0, ug)
+                nld = cls._next_lt_date(lot)
+                if nld is not None and nld <= fy_end:
+                    st_turns_lt_by_fy_end_net += ug
+                    st_turns_lt_by_fy_end_positive += max(0.0, ug)
 
         return PortfolioSummaryOut(
             total_value=round(total_value, 2),
             total_unrealized_gain=round(total_unrealized_gain, 2),
-            ltcg_eligible_value=round(ltcg_eligible_value, 2),
-            stcg_value=round(stcg_value, 2),
+            # Compatibility fields now carry net LT/ST unrealized profit.
+            ltcg_eligible_value=round(lt_unrealized_profit_net, 2),
+            stcg_value=round(st_unrealized_profit_net, 2),
+            lt_bookable_now_net=round(lt_unrealized_profit_net, 2),
+            lt_bookable_max_by_fy_end_net=round(lt_unrealized_profit_net + st_turns_lt_by_fy_end_positive, 2),
+            lt_unrealized_profit_net=round(lt_unrealized_profit_net, 2),
+            st_unrealized_profit_net=round(st_unrealized_profit_net, 2),
+            lt_bookable_gain_positive=round(lt_bookable_gain_positive, 2),
+            st_bookable_gain_positive=round(st_bookable_gain_positive, 2),
             by_broker={k: round(v, 2) for k, v in by_broker.items()},
         )
 
     @classmethod
-    def broker_breakdown(cls, lots: list[Holding]) -> list[PortfolioBrokerBreakdown]:
+    def broker_breakdown(
+        cls, lots: list[Holding], all_brokers: list[str] | None = None
+    ) -> list[PortfolioBrokerBreakdown]:
+        today = date.today()
+        fy_end_year = today.year if today <= date(today.year, 3, 31) else today.year + 1
+        fy_end = date(fy_end_year, 3, 31)
+
         by_broker: dict[str, list[Holding]] = defaultdict(list)
         for lot in lots:
             by_broker[lot.broker].append(lot)
 
+        if all_brokers:
+            for broker in all_brokers:
+                by_broker.setdefault(broker, [])
+
         result: list[PortfolioBrokerBreakdown] = []
         for broker, broker_lots in sorted(by_broker.items()):
-            symbol_rows = cls.holdings_aggregated(broker_lots)
-            symbols = [
-                BrokerSymbolBreakdown(
-                    symbol=h.symbol,
-                    isin=h.isin,
-                    asset_type=h.asset_type,
-                    lt_qty=h.lt_qty,
-                    st_qty=h.st_qty,
-                    lt_value=round(h.lt_qty * h.current_price, 2),
-                    st_value=round(h.st_qty * h.current_price, 2),
-                    next_lt_date=h.next_lt_date,
-                )
-                for h in symbol_rows
-            ]
+            grouped: dict[tuple[str, str, str], list[Holding]] = defaultdict(list)
+            for lot in broker_lots:
+                key = (lot.symbol, lot.isin, normalize_asset_type(lot.asset_type))
+                grouped[key].append(lot)
 
-            lt_value = sum(s.lt_value for s in symbols)
-            st_value = sum(s.st_value for s in symbols)
-            total_value = lt_value + st_value
+            symbols: list[BrokerSymbolBreakdown] = []
+            for (symbol, isin, asset_type), symbol_lots in sorted(grouped.items()):
+                lt_qty = 0.0
+                st_qty = 0.0
+                lt_value = 0.0
+                st_value = 0.0
+                lt_profit_net = 0.0
+                st_profit_net = 0.0
+                st_profit_turns_lt_by_fy_end = 0.0
+                st_profit_beyond_fy_end = 0.0
+                next_lt_dates: list[date] = []
+
+                for lot in symbol_lots:
+                    is_lt = cls._is_lt(lot)
+                    mv = cls._market_value(lot)
+                    ug = cls._unrealized_gain(lot)
+                    nld = cls._next_lt_date(lot)
+                    if is_lt:
+                        lt_qty += lot.quantity
+                        lt_value += mv
+                        lt_profit_net += ug
+                    else:
+                        st_qty += lot.quantity
+                        st_value += mv
+                        st_profit_net += ug
+                        if nld is not None:
+                            next_lt_dates.append(nld)
+                            if nld <= fy_end:
+                                st_profit_turns_lt_by_fy_end += ug
+                            else:
+                                st_profit_beyond_fy_end += ug
+                        else:
+                            st_profit_beyond_fy_end += ug
+
+                symbols.append(
+                    BrokerSymbolBreakdown(
+                        symbol=symbol,
+                        isin=isin,
+                        asset_type=asset_type,
+                        lt_qty=round(lt_qty, 6),
+                        st_qty=round(st_qty, 6),
+                        lt_value=round(lt_value, 2),
+                        st_value=round(st_value, 2),
+                        next_lt_date=min(next_lt_dates) if next_lt_dates else None,
+                        lt_profit_net=round(lt_profit_net, 2),
+                        st_profit_net=round(st_profit_net, 2),
+                        st_profit_turns_lt_by_fy_end=round(st_profit_turns_lt_by_fy_end, 2),
+                        st_profit_beyond_fy_end=round(st_profit_beyond_fy_end, 2),
+                    )
+                )
+
+            lt_profit_net = sum(cls._unrealized_gain(lot) for lot in broker_lots if cls._is_lt(lot))
+            st_profit_net = sum(cls._unrealized_gain(lot) for lot in broker_lots if not cls._is_lt(lot))
+            st_turns_lt_by_fy_end_net = 0.0
+            st_turns_lt_by_fy_end_positive = 0.0
+            for lot in broker_lots:
+                if cls._is_lt(lot):
+                    continue
+                nld = cls._next_lt_date(lot)
+                if nld is not None and nld <= fy_end:
+                    ug = cls._unrealized_gain(lot)
+                    st_turns_lt_by_fy_end_net += ug
+                    st_turns_lt_by_fy_end_positive += max(0.0, ug)
+            st_beyond_fy_end_net = st_profit_net - st_turns_lt_by_fy_end_net
+            lt_bookable_gain_positive = sum(
+                max(0.0, cls._unrealized_gain(lot)) for lot in broker_lots if cls._is_lt(lot)
+            )
+            st_bookable_gain_positive = sum(
+                max(0.0, cls._unrealized_gain(lot)) for lot in broker_lots if not cls._is_lt(lot)
+            )
+            total_value = sum(cls._market_value(lot) for lot in broker_lots)
             unrealized_gain = sum(cls._unrealized_gain(lot) for lot in broker_lots)
             lt_positions = sum(1 for s in symbols if s.lt_qty > 0)
             st_positions = sum(1 for s in symbols if s.st_qty > 0)
@@ -165,11 +254,20 @@ class PortfolioService:
                     broker=broker,
                     summary=BrokerBreakdownSummary(
                         total_value=round(total_value, 2),
-                        lt_value=round(lt_value, 2),
-                        st_value=round(st_value, 2),
+                        # Compatibility fields now carry net LT/ST unrealized profit.
+                        lt_value=round(lt_profit_net, 2),
+                        st_value=round(st_profit_net, 2),
                         unrealized_gain=round(unrealized_gain, 2),
                         lt_positions=lt_positions,
                         st_positions=st_positions,
+                        lt_bookable_now_net=round(lt_profit_net, 2),
+                        lt_bookable_max_by_fy_end_net=round(lt_profit_net + st_turns_lt_by_fy_end_positive, 2),
+                        st_bookable_now_net=round(st_profit_net, 2),
+                        st_bookable_beyond_fy_end_net=round(st_beyond_fy_end_net, 2),
+                        lt_unrealized_profit_net=round(lt_profit_net, 2),
+                        st_unrealized_profit_net=round(st_profit_net, 2),
+                        lt_bookable_gain_positive=round(lt_bookable_gain_positive, 2),
+                        st_bookable_gain_positive=round(st_bookable_gain_positive, 2),
                     ),
                     symbols=symbols,
                 )

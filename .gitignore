@@ -1,0 +1,9 @@
+# Global repo ignores
+**/.venv/
+**/.vscode/
+**/__pycache__/
+**/node_modules/
+
+# Python bytecode
+*.py[codz]
+*$py.class

@@ -43,6 +43,12 @@ button {
   gap: 16px;
 }
 
+.grid.three {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 16px;
+}
+
 .grid.one {
   display: grid;
   grid-template-columns: 1fr;

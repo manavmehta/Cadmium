@@ -2,6 +2,7 @@ import re
 import time
 import logging
 import json
+import asyncio
 import tempfile
 import shutil
 import uuid
@@ -19,7 +20,16 @@ logger = logging.getLogger(__name__)
 
 
 class DataQualityError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str = "DATA_QUALITY",
+        upstream_error_code: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        self.upstream_error_code = upstream_error_code
 
 
 @dataclass(frozen=True)
@@ -57,21 +67,8 @@ BROKER_CONFIG: dict[str, BrokerConfig] = {
             "groww.in/user/",
             "groww.in/stocks/",
         ],
-        auth_cookie_names=[],
+        auth_cookie_names=["AUTH_SESSION_ID"],
         auth_cookie_hints=["access_token", "id_token", "refresh_token", "groww"],
-        require_url_marker_for_success=True,
-    ),
-    "indmoney": BrokerConfig(
-        name="indmoney",
-        login_url="https://indmoney.com/login",
-        holdings_sources=[("default", "https://indmoney.com/stocks/holdings")],
-        login_done_url_markers=[
-            "indmoney.com/stocks/",
-            "indmoney.com/dashboard",
-            "indmoney.com/account",
-        ],
-        auth_cookie_names=[],
-        auth_cookie_hints=["access_token", "id_token", "refresh_token", "auth_token", "jwt"],
         require_url_marker_for_success=True,
     ),
 }
@@ -157,14 +154,6 @@ class BrokerService:
                 and "/login" not in u
                 and "captcha" not in u
                 and "otp" not in u
-            )
-        if broker == "indmoney":
-            return (
-                "indmoney.com" in u
-                and "/login" not in u
-                and "captcha" not in u
-                and "otp" not in u
-                and "verify" not in u
             )
         return False
 
@@ -362,6 +351,10 @@ class BrokerService:
         return float(parsed) if parsed is not None else 0.0
 
     @staticmethod
+    def _groww_price_from_paise(value) -> float:
+        return BrokerService._safe_float(value) / 100.0
+
+    @staticmethod
     def _parse_date_string(raw: str) -> date | None:
         value = (raw or "").strip()
         if not value:
@@ -385,8 +378,22 @@ class BrokerService:
                 continue
         return None
 
+    @staticmethod
+    def _looks_like_isin(value: str) -> bool:
+        token = (value or "").strip().upper()
+        return bool(re.fullmatch(r"[A-Z]{2}[A-Z0-9]{9}[0-9]", token))
+
     @classmethod
-    def _sync_failure(cls, broker: str, message: str, error_code: str = "DATA_QUALITY") -> dict:
+    def _sync_failure(
+        cls,
+        broker: str,
+        message: str,
+        *,
+        error_code: str = "DATA_QUALITY",
+        upstream_error_code: str | None = None,
+        lot_refresh_success: bool = False,
+        price_refresh_success: bool = False,
+    ) -> dict:
         return {
             "broker": broker,
             "success": False,
@@ -395,6 +402,9 @@ class BrokerService:
             "lots_synced": 0,
             "data_quality": "unreliable",
             "error_code": error_code,
+            "upstream_error_code": upstream_error_code,
+            "lot_refresh_success": lot_refresh_success,
+            "price_refresh_success": price_refresh_success,
         }
 
     @classmethod
@@ -531,12 +541,6 @@ class BrokerService:
                 "table tbody tr",
                 ".holdings-table tbody tr",
             ]
-        elif broker == "indmoney":
-            selectors = [
-                "table tbody tr",
-                "[class*='portfolio'] table tbody tr",
-                "[class*='holding'] table tbody tr",
-            ]
         else:
             selectors = ["table tbody tr"]
 
@@ -578,11 +582,17 @@ class BrokerService:
     async def _sync_zerodha_via_api(cls) -> list[Holding]:
         session_path = cls._session_path("zerodha")
         if not session_path.exists():
-            raise RuntimeError("No saved login session for 'zerodha'. Run login first.")
+            raise DataQualityError(
+                "No saved login session for 'zerodha'. Run login first.",
+                error_code="SESSION_MISSING",
+            )
 
         enctoken = cls._extract_cookie_value(session_path, "enctoken")
         if not enctoken:
-            raise RuntimeError("Zerodha session missing enctoken cookie. Please login again.")
+            raise DataQualityError(
+                "Zerodha session missing enctoken cookie. Please login again.",
+                error_code="SESSION_INVALID",
+            )
 
         headers_auth = {"Authorization": f"enctoken {enctoken}", "X-Kite-Version": "3"}
         headers_cookie = {"Cookie": f"enctoken={enctoken}", "X-Kite-Version": "3"}
@@ -594,7 +604,11 @@ class BrokerService:
                 if res.status_code in (401, 403):
                     res = await client.get(url, headers=headers_cookie)
                 if res.status_code >= 400:
-                    raise RuntimeError(f"Zerodha API {url} failed with status {res.status_code}")
+                    raise DataQualityError(
+                        f"Zerodha API {url} failed with status {res.status_code}",
+                        error_code="UPSTREAM_KITE_FAILED",
+                        upstream_error_code=f"KITE_HTTP_{res.status_code}",
+                    )
                 return res.json()
 
             equity = await fetch_json("https://kite.zerodha.com/oms/portfolio/holdings")
@@ -606,18 +620,22 @@ class BrokerService:
             current = float(item.get("last_price") or 0)
             avg = float(item.get("average_price") or current or 0)
             lot_date = cls._parse_date_string(str(item.get("authorised_date") or "")) or date.today()
+            asset_hint = str(item.get("instrument_type") or "").upper()
             if not symbol or qty <= 0 or current <= 0:
                 continue
             holdings.append(
                 Holding(
                     symbol=symbol,
-                    isin=str(item.get("isin") or ""),
+                    isin=str(item.get("isin") or "").strip().upper(),
                     broker="zerodha",
                     quantity=qty,
                     average_buy_price=avg,
                     buy_date=lot_date,
                     current_price=current,
-                    asset_type="stock" if "etf" not in symbol.lower() else "etf",
+                    asset_type="etf" if ("ETF" in asset_hint or "ETF" in symbol) else "stock",
+                    lot_source="snapshot_derived",
+                    sync_run_id="",
+                    data_quality="reliable",
                 )
             )
 
@@ -626,11 +644,15 @@ class BrokerService:
             mf_data = mf_data.get("holdings", []) or []
 
         for item in mf_data:
+            tradingsymbol = str(item.get("tradingsymbol") or "").strip().upper()
+            isin = str(item.get("isin") or "").strip().upper()
+            if not isin and cls._looks_like_isin(tradingsymbol):
+                isin = tradingsymbol
             symbol = str(
-                item.get("tradingsymbol")
-                or item.get("fund")
+                item.get("fund")
                 or item.get("scheme_name")
-                or item.get("isin")
+                or tradingsymbol
+                or isin
                 or ""
             ).strip().upper()
             units = float(item.get("quantity") or item.get("units") or 0)
@@ -641,19 +663,417 @@ class BrokerService:
             holdings.append(
                 Holding(
                     symbol=symbol,
-                    isin=str(item.get("isin") or ""),
+                    isin=isin,
                     broker="zerodha",
                     quantity=units,
                     average_buy_price=avg,
                     buy_date=date.today(),
                     current_price=current,
                     asset_type="mf",
+                    lot_source="snapshot_derived",
+                    sync_run_id="",
+                    data_quality="reliable",
                 )
             )
 
         if not holdings:
-            raise RuntimeError("Zerodha API returned no parsable holdings.")
+            raise DataQualityError(
+                "Zerodha API returned no parsable holdings.",
+                error_code="UPSTREAM_KITE_EMPTY",
+                upstream_error_code="KITE_EMPTY_HOLDINGS",
+            )
         return holdings
+
+    @classmethod
+    def _build_zerodha_price_lookup(
+        cls, snapshot: list[Holding]
+    ) -> tuple[dict[tuple[str, str], float], dict[tuple[str, str], float]]:
+        by_isin: dict[tuple[str, str], float] = {}
+        by_symbol: dict[tuple[str, str], float] = {}
+        for holding in snapshot:
+            current_price = cls._safe_float(holding.current_price)
+            if current_price <= 0:
+                continue
+            asset_type = (holding.asset_type or "stock").lower()
+            symbol = (holding.symbol or "").strip().upper()
+            isin = (holding.isin or "").strip().upper()
+            if isin:
+                by_isin[(isin, asset_type)] = current_price
+                by_isin[(isin, "any")] = current_price
+            if symbol:
+                by_symbol[(symbol, asset_type)] = current_price
+                by_symbol[(symbol, "any")] = current_price
+        return by_isin, by_symbol
+
+    @classmethod
+    def _resolve_zerodha_lot_price(
+        cls,
+        lot: Holding,
+        by_isin: dict[tuple[str, str], float],
+        by_symbol: dict[tuple[str, str], float],
+    ) -> float:
+        asset_type = (lot.asset_type or "stock").lower()
+        symbol = (lot.symbol or "").strip().upper()
+        isin = (lot.isin or "").strip().upper()
+
+        candidates: list[tuple[dict[tuple[str, str], float], tuple[str, str]]] = []
+        if isin:
+            candidates.extend([(by_isin, (isin, asset_type)), (by_isin, (isin, "any"))])
+        if symbol:
+            candidates.extend([(by_symbol, (symbol, asset_type)), (by_symbol, (symbol, "any"))])
+            if asset_type == "mf" and cls._looks_like_isin(symbol):
+                candidates.extend([(by_isin, (symbol, asset_type)), (by_isin, (symbol, "any"))])
+
+        for store, key in candidates:
+            price = store.get(key)
+            if price and price > 0:
+                return price
+        return 0.0
+
+    @classmethod
+    def _refresh_zerodha_mtm_prices(cls, db: Session, snapshot: list[Holding]) -> dict:
+        by_isin, by_symbol = cls._build_zerodha_price_lookup(snapshot)
+        lots = db.query(Holding).filter(Holding.broker == "zerodha").all()
+        if not lots:
+            db.rollback()
+            return {"success": True, "updated": 0, "repaired_mf_zero_prices": 0}
+
+        updated = 0
+        repaired_mf_zero_prices = 0
+        for lot in lots:
+            price = cls._resolve_zerodha_lot_price(lot, by_isin, by_symbol)
+            if price <= 0:
+                continue
+            was_non_positive_mf = (lot.asset_type or "").lower() == "mf" and cls._safe_float(lot.current_price) <= 0
+            if abs(cls._safe_float(lot.current_price) - price) > 1e-9:
+                lot.current_price = price
+                updated += 1
+                if was_non_positive_mf:
+                    repaired_mf_zero_prices += 1
+        db.commit()
+        logger.warning(
+            "Zerodha MTM refresh updated=%s repaired_mf_zero_prices=%s total_lots=%s",
+            updated,
+            repaired_mf_zero_prices,
+            len(lots),
+        )
+        return {
+            "success": True,
+            "updated": updated,
+            "repaired_mf_zero_prices": repaired_mf_zero_prices,
+        }
+
+    @classmethod
+    def _groww_symbol_from_row(cls, row: dict) -> str:
+        sd = row.get("symbolData") or {}
+        symbol = str(
+            sd.get("scripCode")
+            or sd.get("symbol")
+            or sd.get("tradingSymbol")
+            or sd.get("companyShortName")
+            or sd.get("searchId")
+            or ""
+        ).strip().upper()
+        if symbol.endswith("-EQ"):
+            symbol = symbol[:-3]
+        if not symbol:
+            symbol = "UNKNOWN"
+        return symbol[:32]
+
+    @classmethod
+    def _groww_asset_type_from_row(cls, row: dict) -> str:
+        sd = row.get("symbolData") or {}
+        equity_type = str(sd.get("equityType") or "").upper()
+        if equity_type == "ETF":
+            return "etf"
+        return "stock"
+
+    @staticmethod
+    def _sanitize_header_map(headers: dict) -> dict:
+        blocked = {"cookie", "host", "content-length"}
+        cleaned: dict[str, str] = {}
+        for key, value in headers.items():
+            k = str(key or "").lower()
+            if not k or k.startswith(":") or k in blocked:
+                continue
+            if value is None:
+                continue
+            cleaned[k] = str(value)
+        return cleaned
+
+    @classmethod
+    async def _groww_fetch_json(cls, page, url: str, headers: dict) -> dict:
+        response = await page.evaluate(
+            """async ({u,h}) => {
+                try {
+                    const r = await fetch(u, {credentials:'include', headers:h});
+                    const ct = r.headers.get('content-type') || '';
+                    return {ok:true, status:r.status, content_type:ct, text: await r.text()};
+                } catch (e) {
+                    return {ok:false, status:0, content_type:'', text:String(e)};
+                }
+            }""",
+            {"u": url, "h": headers},
+        )
+        if not response.get("ok", True):
+            raise DataQualityError(f"Groww request failed for {url}: {response.get('text', '')[:180]}")
+        status = int(response["status"])
+        if status >= 400:
+            raise DataQualityError(f"Groww API error {status} for {url}: {response.get('text', '')[:180]}")
+        ct = str(response.get("content_type", "")).lower()
+        if "application/json" not in ct:
+            raise DataQualityError(f"Groww API returned non-JSON for {url} (content-type={ct}).")
+        try:
+            return json.loads(response["text"])
+        except json.JSONDecodeError as exc:
+            raise DataQualityError(f"Groww API returned invalid JSON for {url}.") from exc
+
+    @classmethod
+    async def _groww_extract_dom_price_map(cls, page) -> dict[str, float]:
+        rows = await page.evaluate(
+            """() => Array.from(document.querySelectorAll('tr[data-holding-parent]')).map((row) => {
+                const id = row.getAttribute('data-holding-parent') || '';
+                const cells = Array.from(row.querySelectorAll('td')).map((td) => (td.innerText || '').trim());
+                return { id, cells };
+            })"""
+        )
+        out: dict[str, float] = {}
+        for row in rows:
+            symbol_isin = str(row.get("id") or "").strip()
+            if not symbol_isin:
+                continue
+            cells = row.get("cells") or []
+            cell_price_text = cells[2] if len(cells) > 2 else ""
+            current_price = cls._parse_number(str(cell_price_text)) or 0.0
+            if current_price <= 0 and len(cells) > 4:
+                values_text = str(cells[4])
+                nums = re.findall(r"₹\s*([0-9,]+(?:\.[0-9]+)?)", values_text)
+                qty_text = cells[0] if len(cells) > 0 else ""
+                qty = cls._parse_number(str(qty_text)) or 0.0
+                if len(nums) >= 1 and qty > cls.LOT_EPSILON:
+                    current_price = cls._safe_float(nums[0]) / qty
+            if current_price > 0:
+                out[symbol_isin] = current_price
+        return out
+
+    @classmethod
+    async def _groww_fetch_unrealized_transactions(
+        cls, page, headers: dict, symbol_isin: str
+    ) -> list[dict]:
+        all_rows: list[dict] = []
+        for page_num in range(0, 100):
+            url = (
+                "https://groww.in/v1/api/stocks_portfolio/v2/holding/symbol_isin/"
+                f"{symbol_isin}/txns/unrealized?page={page_num}"
+            )
+            payload = await cls._groww_fetch_json(page, url, headers)
+            txns = ((payload.get("data") or {}).get("transactions") or [])
+            if not isinstance(txns, list):
+                raise DataQualityError(
+                    f"Groww txns API returned invalid format for symbol_isin={symbol_isin}."
+                )
+            if not txns:
+                break
+            all_rows.extend([row for row in txns if isinstance(row, dict)])
+            if len(txns) < 10:
+                break
+        return all_rows
+
+    @classmethod
+    def _build_groww_lots(
+        cls,
+        holdings_rows: list[dict],
+        txns_by_symbol_isin: dict[str, list[dict]],
+        current_price_map: dict[str, float],
+        sync_run_id: str,
+    ) -> list[Holding]:
+        lots: list[Holding] = []
+        for row in holdings_rows:
+            sd = row.get("symbolData") or {}
+            symbol_isin = str(sd.get("symbolIsin") or "").strip()
+            if not symbol_isin:
+                raise DataQualityError("Groww holding row missing symbolIsin.")
+            symbol = cls._groww_symbol_from_row(row)
+            asset_type = cls._groww_asset_type_from_row(row)
+            target_qty = cls._safe_float(row.get("holdingQty") or row.get("netQty"))
+            if target_qty <= cls.LOT_EPSILON:
+                continue
+
+            txns = txns_by_symbol_isin.get(symbol_isin) or []
+            if not txns:
+                raise DataQualityError(
+                    f"Groww lot transactions unavailable for {symbol} ({symbol_isin})."
+                )
+
+            fifo: list[dict] = []
+            sorted_txns = sorted(
+                txns,
+                key=lambda t: (
+                    str(t.get("tradeDate") or ""),
+                    str(t.get("txnId") or ""),
+                ),
+            )
+            for txn in sorted_txns:
+                qty = cls._safe_float(txn.get("qty"))
+                if qty <= cls.LOT_EPSILON:
+                    continue
+                txn_type = str(txn.get("type") or "").upper()
+                price = cls._groww_price_from_paise(txn.get("price"))
+                trade_date = cls._parse_date_string(str(txn.get("tradeDate") or ""))
+                if trade_date is None:
+                    continue
+                if txn_type == "DEBIT":
+                    remaining = qty
+                    while remaining > cls.LOT_EPSILON and fifo:
+                        cut = min(fifo[0]["qty"], remaining)
+                        fifo[0]["qty"] -= cut
+                        remaining -= cut
+                        if fifo[0]["qty"] <= cls.LOT_EPSILON:
+                            fifo.pop(0)
+                    continue
+                # CREDIT and unknown types are treated as buy additions.
+                fifo.append(
+                    {
+                        "qty": qty,
+                        "price": price,
+                        "buy_date": trade_date,
+                    }
+                )
+
+            open_qty = sum(item["qty"] for item in fifo if item["qty"] > cls.LOT_EPSILON)
+            if abs(open_qty - target_qty) > 0.01:
+                raise DataQualityError(
+                    f"Groww lot quantity mismatch for {symbol}: holding={target_qty}, lots={round(open_qty, 6)}."
+                )
+
+            current_price = current_price_map.get(symbol_isin)
+            if current_price is None or current_price <= 0:
+                current_price = cls._groww_price_from_paise(row.get("holdingAvgPrice"))
+            if current_price <= 0:
+                raise DataQualityError(f"Groww current price unavailable for {symbol}.")
+
+            for item in fifo:
+                qty = item["qty"]
+                if qty <= cls.LOT_EPSILON:
+                    continue
+                lots.append(
+                    Holding(
+                        symbol=symbol,
+                        isin=symbol_isin,
+                        broker="groww",
+                        quantity=qty,
+                        average_buy_price=item["price"] if item["price"] > 0 else current_price,
+                        buy_date=item["buy_date"],
+                        current_price=current_price,
+                        asset_type=asset_type,
+                        lot_source="tradebook",
+                        sync_run_id=sync_run_id,
+                        data_quality="reliable",
+                    )
+                )
+        return lots
+
+    @classmethod
+    async def _sync_groww_lots(cls, db: Session) -> dict:
+        session_path = cls._session_path("groww")
+        if not session_path.exists():
+            raise DataQualityError("No saved login session for 'groww'. Run login first.")
+
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(storage_state=str(session_path))
+            page = await context.new_page()
+
+            holdings_headers: dict = {}
+
+            async def on_request(req):
+                nonlocal holdings_headers
+                if "/v2/api/stocks/holdings/all" in req.url and not holdings_headers:
+                    headers = await req.all_headers()
+                    holdings_headers = cls._sanitize_header_map(headers)
+
+            page.on("request", lambda req: asyncio.create_task(on_request(req)))
+
+            await page.goto("https://groww.in/stocks/user/holdings", wait_until="networkidle", timeout=90000)
+            if "login" in page.url.lower():
+                await browser.close()
+                raise DataQualityError("Groww session expired. Please login again.")
+
+            await page.wait_for_timeout(2500)
+            if not holdings_headers:
+                await browser.close()
+                raise DataQualityError("Unable to capture authenticated Groww holdings request headers.")
+
+            holdings_payload = await cls._groww_fetch_json(
+                page,
+                "https://groww.in/v2/api/stocks/holdings/all?source=other",
+                holdings_headers,
+            )
+            holdings_rows = holdings_payload.get("holdings") or []
+            if not isinstance(holdings_rows, list):
+                await browser.close()
+                raise DataQualityError("Groww holdings API returned invalid holdings list.")
+            holdings_rows = [row for row in holdings_rows if isinstance(row, dict)]
+            if not holdings_rows:
+                await browser.close()
+                with db.begin():
+                    db.query(Holding).filter(Holding.broker == "groww").delete()
+                return {
+                    "broker": "groww",
+                    "success": True,
+                    "message": "Synced groww: account has no holdings.",
+                    "holdings_synced": 0,
+                    "lots_synced": 0,
+                    "data_quality": "reliable",
+                    "error_code": None,
+                    "upstream_error_code": None,
+                    "lot_refresh_success": True,
+                    "price_refresh_success": True,
+                }
+
+            current_price_map = await cls._groww_extract_dom_price_map(page)
+
+            txns_by_symbol_isin: dict[str, list[dict]] = {}
+            for row in holdings_rows:
+                sd = row.get("symbolData") or {}
+                symbol_isin = str(sd.get("symbolIsin") or "").strip()
+                qty = cls._safe_float(row.get("holdingQty") or row.get("netQty"))
+                if not symbol_isin or qty <= cls.LOT_EPSILON:
+                    continue
+                txns_by_symbol_isin[symbol_isin] = await cls._groww_fetch_unrealized_transactions(
+                    page, holdings_headers, symbol_isin
+                )
+
+            await browser.close()
+
+        sync_run_id = uuid.uuid4().hex
+        lots = cls._build_groww_lots(holdings_rows, txns_by_symbol_isin, current_price_map, sync_run_id)
+        if not lots:
+            raise DataQualityError("No open lots could be reconstructed from Groww holdings transactions.")
+
+        try:
+            with db.begin():
+                db.query(Holding).filter(Holding.broker == "groww").delete()
+                db.add_all(lots)
+        except Exception:
+            db.rollback()
+            raise
+
+        symbols_count = len({(l.symbol, l.isin) for l in lots})
+        return {
+            "broker": "groww",
+            "success": True,
+            "message": f"Synced groww with lot-level transactions ({symbols_count} symbols, {len(lots)} lots).",
+            "holdings_synced": symbols_count,
+            "lots_synced": len(lots),
+            "data_quality": "reliable",
+            "error_code": None,
+            "upstream_error_code": None,
+            "lot_refresh_success": True,
+            "price_refresh_success": True,
+        }
 
     @classmethod
     async def _console_fetch_json(cls, page, url: str, csrf_token: str) -> dict:
@@ -671,16 +1091,34 @@ class BrokerService:
             {"u": full_url, "t": csrf_token},
         )
         if not response.get("ok", True):
-            raise RuntimeError(f"Console API request failed for {full_url}: {response.get('text', '')[:180]}")
+            raise DataQualityError(
+                f"Console API request failed for {full_url}: {response.get('text', '')[:180]}",
+                error_code="UPSTREAM_CONSOLE_UNAVAILABLE",
+                upstream_error_code="CONSOLE_NETWORK_FAILURE",
+            )
         if int(response["status"]) >= 400:
-            raise RuntimeError(f"Console API error {response['status']} for {full_url}: {response['text'][:180]}")
+            status = int(response["status"])
+            raise DataQualityError(
+                f"Console API error {status} for {full_url}: {response['text'][:180]}",
+                error_code="UPSTREAM_CONSOLE_UNAVAILABLE",
+                upstream_error_code=f"CONSOLE_HTTP_{status}",
+            )
         ct = str(response.get("content_type", "")).lower()
         if "application/json" not in ct:
-            raise RuntimeError(
+            raise DataQualityError(
                 f"Console API returned non-JSON response for {full_url} "
-                f"(content-type={response.get('content_type', '')})."
+                f"(content-type={response.get('content_type', '')}).",
+                error_code="UPSTREAM_CONSOLE_UNAVAILABLE",
+                upstream_error_code="CONSOLE_NON_JSON",
             )
-        return json.loads(response["text"])
+        try:
+            return json.loads(response["text"])
+        except json.JSONDecodeError as exc:
+            raise DataQualityError(
+                f"Console API returned invalid JSON for {full_url}.",
+                error_code="UPSTREAM_CONSOLE_UNAVAILABLE",
+                upstream_error_code="CONSOLE_INVALID_JSON",
+            ) from exc
 
     @classmethod
     async def _console_try_fetch_json(cls, page, url: str, csrf_token: str) -> tuple[int, dict | list | None]:
@@ -788,35 +1226,69 @@ class BrokerService:
         return None
 
     @classmethod
-    async def _console_fetch_holdings_universe(cls, page, csrf_token: str) -> tuple[list[dict], list[dict]]:
-        today = date.today().isoformat()
-        for i in range(20):
-            status, payload = await cls._console_try_fetch_json(
-                page, f"/api/reports/holdings/portfolio?date={today}", csrf_token
-            )
-            if status >= 400:
-                raise DataQualityError(
-                    f"Console holdings universe API failed with status {status} for date={today}."
+    async def _console_fetch_holdings_universe(
+        cls, page, csrf_token: str, days_back: int = 7
+    ) -> tuple[list[dict], list[dict], str]:
+        last_error = "unknown_error"
+        for day_offset in range(0, max(0, days_back) + 1):
+            target_date = (date.today() - timedelta(days=day_offset)).isoformat()
+            for poll_idx in range(20):
+                status, payload = await cls._console_try_fetch_json(
+                    page, f"/api/reports/holdings/portfolio?date={target_date}", csrf_token
                 )
-            if not isinstance(payload, dict):
-                await page.wait_for_timeout(600)
-                continue
-            data = payload.get("data") or {}
-            state = str(data.get("state") or "").upper()
-            result = data.get("result") or {}
-            if state == "SUCCESS" and isinstance(result, dict):
-                eq_rows = result.get("eq") or []
-                mf_rows = result.get("mf") or []
-                if not isinstance(eq_rows, list):
-                    eq_rows = []
-                if not isinstance(mf_rows, list):
-                    mf_rows = []
-                return eq_rows, mf_rows
-            if state in {"PENDING", "PROCESSING"}:
-                await page.wait_for_timeout(900 + min(i, 8) * 150)
-                continue
-            await page.wait_for_timeout(600)
-        raise DataQualityError("Console holdings universe timed out before SUCCESS.")
+                if status in {0, 500, 502, 503, 504}:
+                    logger.warning(
+                        "Console holdings universe retryable status=%s date=%s poll=%s",
+                        status,
+                        target_date,
+                        poll_idx + 1,
+                    )
+                    last_error = f"retryable_http_{status or 'network'}_date_{target_date}"
+                    await page.wait_for_timeout(800 + min(poll_idx, 8) * 150)
+                    continue
+                if status >= 400:
+                    logger.warning(
+                        "Console holdings universe non-retryable status=%s date=%s",
+                        status,
+                        target_date,
+                    )
+                    last_error = f"http_{status}_date_{target_date}"
+                    break
+                if not isinstance(payload, dict):
+                    last_error = f"invalid_payload_date_{target_date}"
+                    await page.wait_for_timeout(600)
+                    continue
+
+                data = payload.get("data") or {}
+                state = str(data.get("state") or "").upper()
+                result = data.get("result") or {}
+                if state == "SUCCESS" and isinstance(result, dict):
+                    eq_rows = result.get("eq") or []
+                    mf_rows = result.get("mf") or []
+                    if not isinstance(eq_rows, list):
+                        eq_rows = []
+                    if not isinstance(mf_rows, list):
+                        mf_rows = []
+                    logger.warning(
+                        "Console holdings universe SUCCESS date=%s eq_rows=%s mf_rows=%s",
+                        target_date,
+                        len(eq_rows),
+                        len(mf_rows),
+                    )
+                    return eq_rows, mf_rows, target_date
+                if state in {"PENDING", "PROCESSING", "QUEUED", "STARTED"}:
+                    await page.wait_for_timeout(900 + min(poll_idx, 8) * 150)
+                    continue
+
+                message = str(payload.get("message") or payload.get("error_type") or "unknown_state")
+                last_error = f"state_{state.lower()}_{message.strip()[:120]}"
+                break
+
+        raise DataQualityError(
+            "Console holdings universe is unavailable across date fallback window (today to today-7).",
+            error_code="UPSTREAM_CONSOLE_UNAVAILABLE",
+            upstream_error_code=last_error.upper(),
+        )
 
     @classmethod
     async def _console_fetch_holdings_breakdown_rows(
@@ -836,13 +1308,15 @@ class BrokerService:
         for h in snapshot:
             symbol = (h.symbol or "").upper()
             isin = (h.isin or "").upper()
+            inferred_isin = symbol if (not isin and cls._looks_like_isin(symbol)) else ""
+            canonical_isin = isin or inferred_isin
             key_exact = (symbol, isin)
             key_symbol = (symbol, "")
-            key_isin = ("", isin) if isin else None
+            key_isin = ("", canonical_isin) if canonical_isin else None
             for key in [key_exact, key_symbol] + ([key_isin] if key_isin else []):
                 if key is None:
                     continue
-                price_map[key] = (h.current_price, h.isin, h.asset_type)
+                price_map[key] = (h.current_price, canonical_isin, h.asset_type)
                 snapshot_qty[key] = snapshot_qty.get(key, 0.0) + h.quantity
             if (h.asset_type or "").lower() == "mf":
                 snapshot_mf_total_qty += h.quantity
@@ -854,12 +1328,18 @@ class BrokerService:
     ) -> tuple[float, str, str]:
         symbol_u = (symbol or "").upper()
         isin_u = (isin or "").upper()
+        inferred_isin = symbol_u if not isin_u and cls._looks_like_isin(symbol_u) else ""
         candidates = [(symbol_u, isin_u), (symbol_u, ""), ("", isin_u)]
+        if inferred_isin:
+            candidates.append(("", inferred_isin))
         for key in candidates:
             if key in price_map:
-                return price_map[key]
+                price, resolved_isin, asset_type = price_map[key]
+                if not resolved_isin and inferred_isin:
+                    resolved_isin = inferred_isin
+                return price, resolved_isin, asset_type
         asset_type = "mf" if segment == "MF" else "stock"
-        return 0.0, isin, asset_type
+        return 0.0, (isin_u or inferred_isin), asset_type
 
     @classmethod
     def _build_lots_from_breakdown(
@@ -884,7 +1364,10 @@ class BrokerService:
         current_price, resolved_isin, asset_type = cls._resolve_snapshot_meta(price_map, symbol, isin, segment)
         if current_price <= 0:
             current_price = cls._safe_float(
-                cls._pick_value(instrument_row, ["last_price", "ltp", "nav", "current_price", "market_price"])
+                cls._pick_value(
+                    instrument_row,
+                    ["last_price", "ltp", "close_price", "nav", "current_price", "market_price"],
+                )
             )
 
         lots: list[Holding] = []
@@ -1065,12 +1548,44 @@ class BrokerService:
                 "LOT_SYNC_V2 is disabled. Enable LOT_SYNC_V2 to run deterministic lot sync.",
                 error_code="FEATURE_FLAG_DISABLED",
             )
-        # Snapshot gives current holdings universe + live price.
-        snapshot = await cls._sync_zerodha_via_api()
-        if not snapshot:
-            raise DataQualityError("Zerodha holdings snapshot is empty.")
+        snapshot: list[Holding] = []
+        price_refresh_success = False
+        price_refresh_msg = "Price refresh skipped."
 
-        price_map, snapshot_qty, snapshot_mf_total_qty = cls._build_zerodha_snapshot_maps(snapshot)
+        try:
+            snapshot = await cls._sync_zerodha_via_api()
+            if not snapshot:
+                raise DataQualityError("Zerodha holdings snapshot is empty.", error_code="UPSTREAM_KITE_EMPTY")
+        except DataQualityError as exc:
+            return cls._sync_failure(
+                "zerodha",
+                f"Zerodha snapshot fetch failed: {exc}",
+                error_code=exc.error_code,
+                upstream_error_code=exc.upstream_error_code,
+            )
+        except Exception as exc:
+            logger.exception("Zerodha snapshot fetch failed")
+            return cls._sync_failure(
+                "zerodha",
+                f"Zerodha snapshot fetch failed: {exc}",
+                error_code="UPSTREAM_KITE_FAILED",
+                upstream_error_code="KITE_UNEXPECTED_ERROR",
+            )
+
+        try:
+            mtm_result = cls._refresh_zerodha_mtm_prices(db, snapshot)
+            price_refresh_success = bool(mtm_result.get("success"))
+            price_refresh_msg = (
+                f"Price refresh updated {mtm_result.get('updated', 0)} lots "
+                f"(MF repaired: {mtm_result.get('repaired_mf_zero_prices', 0)})."
+            )
+        except Exception as exc:
+            db.rollback()
+            logger.exception("Zerodha MTM refresh failed")
+            price_refresh_success = False
+            price_refresh_msg = f"Price refresh failed: {exc}"
+
+        price_map, _, snapshot_mf_total_qty = cls._build_zerodha_snapshot_maps(snapshot)
         snapshot_eq_total_qty = sum(
             h.quantity for h in snapshot if (h.asset_type or "").lower() in {"stock", "etf", "equity"}
         )
@@ -1078,132 +1593,163 @@ class BrokerService:
         from playwright.async_api import async_playwright
 
         session_path = cls._session_path("zerodha")
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(storage_state=str(session_path))
-            console_ok = await cls._zerodha_console_is_authenticated(context)
-            if not console_ok:
-                await browser.close()
-                raise DataQualityError(
-                    "Zerodha Console session is not authenticated. "
-                    "Run Zerodha login and complete 'LOGIN WITH KITE' on Console."
-                )
-
-            cookies = await context.cookies("https://console.zerodha.com")
-            token = ""
-            for c in cookies:
-                if c.get("name") == "public_token":
-                    token = str(c.get("value") or "")
-                    break
-            if not token:
-                await browser.close()
-                raise DataQualityError("Unable to read Zerodha Console CSRF token.")
-            page = context.pages[-1] if context.pages else await context.new_page()
-
-            eq_holdings, mf_holdings = await cls._console_fetch_holdings_universe(page, token)
-            await browser.close()
-
-        if snapshot_eq_total_qty > cls.LOT_EPSILON and not eq_holdings:
-            raise DataQualityError(
-                "Zerodha EQ holdings exist but Console holdings universe (EQ) is unavailable."
-            )
-        if snapshot_mf_total_qty > cls.LOT_EPSILON and not mf_holdings:
-            raise DataQualityError(
-                "Zerodha MF holdings exist but Console holdings universe (MF) is unavailable. "
-                "Sync aborted due to insufficient lot data quality."
-            )
-
-        sync_run_id = uuid.uuid4().hex
-        lots: list[Holding] = []
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(storage_state=str(session_path))
-            console_ok = await cls._zerodha_console_is_authenticated(context)
-            if not console_ok:
-                await browser.close()
-                raise DataQualityError(
-                    "Zerodha Console session is not authenticated for holdings breakdown access."
-                )
-            cookies = await context.cookies("https://console.zerodha.com")
-            token = ""
-            for c in cookies:
-                if c.get("name") == "public_token":
-                    token = str(c.get("value") or "")
-                    break
-            if not token:
-                await browser.close()
-                raise DataQualityError("Unable to read Zerodha Console CSRF token for breakdown calls.")
-            page = context.pages[-1] if context.pages else await context.new_page()
-
-            for segment, holdings_rows in [("EQ", eq_holdings), ("MF", mf_holdings)]:
-                for instrument_row in holdings_rows:
-                    instrument_id = str(
-                        cls._pick_value(instrument_row, ["instrument_id", "instrument_token", "instrument"])
-                        or ""
-                    ).strip()
-                    if not instrument_id:
-                        raise DataQualityError(
-                            f"Missing instrument_id for Zerodha {segment} holding row; cannot fetch breakdown."
-                        )
-                    qty = cls._safe_float(
-                        cls._pick_value(
-                            instrument_row,
-                            ["quantity_available", "total_quantity", "quantity", "qty", "units", "net_quantity"],
-                        )
-                    )
-                    if qty <= cls.LOT_EPSILON:
-                        continue
-                    breakdown_rows = await cls._console_fetch_holdings_breakdown_rows(
-                        page, token, instrument_id, segment
-                    )
-                    lots.extend(
-                        cls._build_lots_from_breakdown(
-                            instrument_row, breakdown_rows, segment, price_map, sync_run_id
-                        )
-                    )
-            await browser.close()
-
-        if not lots:
-            raise DataQualityError("No open lots could be reconstructed from Zerodha holdings breakdown.")
-
-        snapshot_qty_canonical: dict[tuple[str, str], float] = {}
-        for h in snapshot:
-            identity = ((h.isin or h.symbol or "").upper(), (h.asset_type or "stock").lower())
-            snapshot_qty_canonical[identity] = snapshot_qty_canonical.get(identity, 0.0) + h.quantity
-
-        lot_qty_canonical: dict[tuple[str, str], float] = {}
-        for l in lots:
-            identity = ((l.isin or l.symbol or "").upper(), (l.asset_type or "stock").lower())
-            lot_qty_canonical[identity] = lot_qty_canonical.get(identity, 0.0) + l.quantity
-
-        mismatches: list[str] = []
-        for key, snap_q in snapshot_qty_canonical.items():
-            lot_q = lot_qty_canonical.get(key, 0.0)
-            if abs(snap_q - lot_q) > 0.01:
-                label, asset = key
-                mismatches.append(f"{label} ({asset}) snapshot={snap_q} lots={lot_q}")
-        if mismatches:
-            raise DataQualityError(
-                "Lot reconstruction mismatch vs Zerodha snapshot: "
-                + "; ".join(mismatches[:8])
-            )
         try:
+            sync_run_id = uuid.uuid4().hex
+            lots: list[Holding] = []
+            date_used = ""
+
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                try:
+                    context = await browser.new_context(storage_state=str(session_path))
+                    console_ok = await cls._zerodha_console_is_authenticated(context)
+                    if not console_ok:
+                        raise DataQualityError(
+                            "Zerodha Console session is not authenticated. "
+                            "Run Zerodha login and complete 'LOGIN WITH KITE' on Console.",
+                            error_code="SESSION_INVALID",
+                            upstream_error_code="CONSOLE_AUTH_REQUIRED",
+                        )
+
+                    cookies = await context.cookies("https://console.zerodha.com")
+                    token = ""
+                    for c in cookies:
+                        if c.get("name") == "public_token":
+                            token = str(c.get("value") or "")
+                            break
+                    if not token:
+                        raise DataQualityError(
+                            "Unable to read Zerodha Console CSRF token.",
+                            error_code="SESSION_INVALID",
+                            upstream_error_code="CONSOLE_TOKEN_MISSING",
+                        )
+                    page = context.pages[-1] if context.pages else await context.new_page()
+
+                    eq_holdings, mf_holdings, date_used = await cls._console_fetch_holdings_universe(page, token)
+
+                    if snapshot_eq_total_qty > cls.LOT_EPSILON and not eq_holdings:
+                        raise DataQualityError(
+                            "Zerodha EQ holdings exist but Console holdings universe (EQ) is unavailable.",
+                            error_code="UPSTREAM_CONSOLE_UNAVAILABLE",
+                            upstream_error_code="CONSOLE_EQ_UNAVAILABLE",
+                        )
+                    if snapshot_mf_total_qty > cls.LOT_EPSILON and not mf_holdings:
+                        raise DataQualityError(
+                            "Zerodha MF holdings exist but Console holdings universe (MF) is unavailable. "
+                            "Sync aborted due to insufficient lot data quality.",
+                            error_code="UPSTREAM_CONSOLE_UNAVAILABLE",
+                            upstream_error_code="CONSOLE_MF_UNAVAILABLE",
+                        )
+
+                    for segment, holdings_rows in [("EQ", eq_holdings), ("MF", mf_holdings)]:
+                        for instrument_row in holdings_rows:
+                            instrument_id = str(
+                                cls._pick_value(
+                                    instrument_row, ["instrument_id", "instrument_token", "instrument"]
+                                )
+                                or ""
+                            ).strip()
+                            if not instrument_id:
+                                raise DataQualityError(
+                                    f"Missing instrument_id for Zerodha {segment} holding row; cannot fetch breakdown.",
+                                    error_code="DATA_QUALITY",
+                                    upstream_error_code="CONSOLE_INSTRUMENT_ID_MISSING",
+                                )
+                            qty = cls._safe_float(
+                                cls._pick_value(
+                                    instrument_row,
+                                    [
+                                        "quantity_available",
+                                        "total_quantity",
+                                        "quantity",
+                                        "qty",
+                                        "units",
+                                        "net_quantity",
+                                    ],
+                                )
+                            )
+                            if qty <= cls.LOT_EPSILON:
+                                continue
+                            breakdown_rows = await cls._console_fetch_holdings_breakdown_rows(
+                                page, token, instrument_id, segment
+                            )
+                            lots.extend(
+                                cls._build_lots_from_breakdown(
+                                    instrument_row, breakdown_rows, segment, price_map, sync_run_id
+                                )
+                            )
+                finally:
+                    await browser.close()
+
+            if not lots:
+                raise DataQualityError(
+                    "No open lots could be reconstructed from Zerodha holdings breakdown.",
+                    error_code="DATA_QUALITY",
+                )
+
+            snapshot_qty_canonical: dict[tuple[str, str], float] = {}
+            for h in snapshot:
+                identity = ((h.isin or h.symbol or "").upper(), (h.asset_type or "stock").lower())
+                snapshot_qty_canonical[identity] = snapshot_qty_canonical.get(identity, 0.0) + h.quantity
+
+            lot_qty_canonical: dict[tuple[str, str], float] = {}
+            for l in lots:
+                identity = ((l.isin or l.symbol or "").upper(), (l.asset_type or "stock").lower())
+                lot_qty_canonical[identity] = lot_qty_canonical.get(identity, 0.0) + l.quantity
+
+            mismatches: list[str] = []
+            for key, snap_q in snapshot_qty_canonical.items():
+                lot_q = lot_qty_canonical.get(key, 0.0)
+                if abs(snap_q - lot_q) > 0.01:
+                    label, asset = key
+                    mismatches.append(f"{label} ({asset}) snapshot={snap_q} lots={lot_q}")
+            if mismatches:
+                raise DataQualityError(
+                    "Lot reconstruction mismatch vs Zerodha snapshot: " + "; ".join(mismatches[:8]),
+                    error_code="DATA_QUALITY",
+                )
+
             with db.begin():
                 db.query(Holding).filter(Holding.broker == "zerodha").delete()
                 db.add_all(lots)
-        except Exception:
+
+            symbols_count = len({(l.symbol, l.isin) for l in lots})
+            return {
+                "broker": "zerodha",
+                "success": True,
+                "message": (
+                    f"Synced zerodha with lot-level breakdown ({symbols_count} symbols, {len(lots)} lots) "
+                    f"using holdings date {date_used}. {price_refresh_msg}"
+                ),
+                "holdings_synced": symbols_count,
+                "lots_synced": len(lots),
+                "data_quality": "reliable",
+                "error_code": None,
+                "upstream_error_code": None,
+                "lot_refresh_success": True,
+                "price_refresh_success": price_refresh_success,
+            }
+        except DataQualityError as exc:
             db.rollback()
-            raise
-        symbols_count = len({(l.symbol, l.isin) for l in lots})
-        return {
-            "broker": "zerodha",
-            "success": True,
-            "message": f"Synced zerodha with lot-level breakdown ({symbols_count} symbols, {len(lots)} lots).",
-            "holdings_synced": symbols_count,
-            "lots_synced": len(lots),
-            "data_quality": "reliable",
-            "error_code": None,
-        }
+            return cls._sync_failure(
+                "zerodha",
+                f"{exc} {price_refresh_msg}".strip(),
+                error_code=exc.error_code,
+                upstream_error_code=exc.upstream_error_code,
+                lot_refresh_success=False,
+                price_refresh_success=price_refresh_success,
+            )
+        except Exception as exc:
+            db.rollback()
+            logger.exception("Zerodha lot sync failed")
+            return cls._sync_failure(
+                "zerodha",
+                f"zerodha sync failed: {exc}. {price_refresh_msg}",
+                error_code="SYNC_FAILED",
+                upstream_error_code="ZERODHA_SYNC_EXCEPTION",
+                lot_refresh_success=False,
+                price_refresh_success=price_refresh_success,
+            )
 
     @classmethod
     async def _scrape_rows_for_source(cls, broker: str, source: str, holdings_url: str) -> list[list[str]]:
@@ -1239,7 +1785,7 @@ class BrokerService:
                 continue
 
             quantity = numbers[0]
-            if broker in ("groww", "indmoney"):
+            if broker == "groww":
                 current_price = numbers[1]
                 average_buy_price = numbers[2] if len(numbers) > 2 else current_price
             else:
@@ -1275,6 +1821,8 @@ class BrokerService:
         try:
             if broker == "zerodha":
                 return await cls._sync_zerodha_lots(db)
+            if broker == "groww":
+                return await cls._sync_groww_lots(db)
             # No-lot policy: if tradebook-level lots are not available, fail explicitly.
             raise DataQualityError(
                 f"{broker} lot-level trade history adapter is not implemented yet. "
@@ -1282,7 +1830,12 @@ class BrokerService:
             )
         except DataQualityError as exc:
             db.rollback()
-            return cls._sync_failure(broker, str(exc))
+            return cls._sync_failure(
+                broker,
+                str(exc),
+                error_code=exc.error_code,
+                upstream_error_code=exc.upstream_error_code,
+            )
         except Exception as exc:
             db.rollback()
             logger.exception("Broker sync failed for %s", broker)

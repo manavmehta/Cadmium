@@ -26,16 +26,27 @@ class PortfolioSummaryOut(BaseModel):
     total_unrealized_gain: float
     ltcg_eligible_value: float
     stcg_value: float
+    lt_bookable_now_net: float = 0.0
+    lt_bookable_max_by_fy_end_net: float = 0.0
+    lt_unrealized_profit_net: float = 0.0
+    st_unrealized_profit_net: float = 0.0
+    lt_bookable_gain_positive: float = 0.0
+    st_bookable_gain_positive: float = 0.0
     by_broker: dict[str, float]
 
 
 class TaxAnalysisOut(BaseModel):
+    realized_data_available: bool = False
     total_ltcg_realized: float
     total_ltcg_unrealized: float
+    total_ltcg_unrealized_by_fy_end: float = 0.0
     remaining_tax_free_ltcg: float
     harvestable_gains: float
+    harvestable_gains_by_fy_end: float = 0.0
     equity_ltcg_unrealized: float = 0.0
     mf_ltcg_unrealized: float = 0.0
+    equity_ltcg_unrealized_by_fy_end: float = 0.0
+    mf_ltcg_unrealized_by_fy_end: float = 0.0
 
 
 class HarvestRecommendationItem(BaseModel):
@@ -64,6 +75,9 @@ class BrokerActionResponse(BaseModel):
     lots_synced: int = 0
     data_quality: str = "unreliable"
     error_code: str | None = None
+    upstream_error_code: str | None = None
+    lot_refresh_success: bool = False
+    price_refresh_success: bool = False
 
 
 class BrokerSyncResult(BaseModel):
@@ -74,6 +88,9 @@ class BrokerSyncResult(BaseModel):
     data_quality: str = "unreliable"
     message: str
     error_code: str | None = None
+    upstream_error_code: str | None = None
+    lot_refresh_success: bool = False
+    price_refresh_success: bool = False
 
 
 class BrokerStatusItem(BaseModel):
@@ -91,6 +108,10 @@ class BrokerSymbolBreakdown(BaseModel):
     lt_value: float
     st_value: float
     next_lt_date: date | None = None
+    lt_profit_net: float = 0.0
+    st_profit_net: float = 0.0
+    st_profit_turns_lt_by_fy_end: float = 0.0
+    st_profit_beyond_fy_end: float = 0.0
 
 
 class BrokerBreakdownSummary(BaseModel):
@@ -100,6 +121,14 @@ class BrokerBreakdownSummary(BaseModel):
     unrealized_gain: float
     lt_positions: int
     st_positions: int
+    lt_bookable_now_net: float = 0.0
+    lt_bookable_max_by_fy_end_net: float = 0.0
+    st_bookable_now_net: float = 0.0
+    st_bookable_beyond_fy_end_net: float = 0.0
+    lt_unrealized_profit_net: float = 0.0
+    st_unrealized_profit_net: float = 0.0
+    lt_bookable_gain_positive: float = 0.0
+    st_bookable_gain_positive: float = 0.0
 
 
 class PortfolioBrokerBreakdown(BaseModel):

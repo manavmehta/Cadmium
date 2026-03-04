@@ -22,16 +22,27 @@ export type PortfolioSummary = {
   total_unrealized_gain: number;
   ltcg_eligible_value: number;
   stcg_value: number;
+  lt_bookable_now_net?: number;
+  lt_bookable_max_by_fy_end_net?: number;
+  lt_unrealized_profit_net?: number;
+  st_unrealized_profit_net?: number;
+  lt_bookable_gain_positive?: number;
+  st_bookable_gain_positive?: number;
   by_broker: Record<string, number>;
 };
 
 export type TaxAnalysis = {
+  realized_data_available?: boolean;
   total_ltcg_realized: number;
   total_ltcg_unrealized: number;
+  total_ltcg_unrealized_by_fy_end?: number;
   remaining_tax_free_ltcg: number;
   harvestable_gains: number;
+  harvestable_gains_by_fy_end?: number;
   equity_ltcg_unrealized: number;
   mf_ltcg_unrealized: number;
+  equity_ltcg_unrealized_by_fy_end?: number;
+  mf_ltcg_unrealized_by_fy_end?: number;
 };
 
 export type HarvestRecommendation = {
@@ -59,6 +70,9 @@ export type BrokerActionResponse = {
   lots_synced: number;
   data_quality: "reliable" | "unreliable" | string;
   error_code?: string | null;
+  upstream_error_code?: string | null;
+  lot_refresh_success?: boolean;
+  price_refresh_success?: boolean;
 };
 
 export type BrokerSymbolBreakdown = {
@@ -70,6 +84,10 @@ export type BrokerSymbolBreakdown = {
   lt_value: number;
   st_value: number;
   next_lt_date?: string | null;
+  lt_profit_net?: number;
+  st_profit_net?: number;
+  st_profit_turns_lt_by_fy_end?: number;
+  st_profit_beyond_fy_end?: number;
 };
 
 export type PortfolioBrokerBreakdown = {
@@ -81,6 +99,14 @@ export type PortfolioBrokerBreakdown = {
     unrealized_gain: number;
     lt_positions: number;
     st_positions: number;
+    lt_bookable_now_net?: number;
+    lt_bookable_max_by_fy_end_net?: number;
+    st_bookable_now_net?: number;
+    st_bookable_beyond_fy_end_net?: number;
+    lt_unrealized_profit_net?: number;
+    st_unrealized_profit_net?: number;
+    lt_bookable_gain_positive?: number;
+    st_bookable_gain_positive?: number;
   };
   symbols: BrokerSymbolBreakdown[];
 };

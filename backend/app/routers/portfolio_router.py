@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.holding import Holding
 from app.schemas.api_schemas import HoldingOut, PortfolioBrokerBreakdown, PortfolioSummaryOut
+from app.services.broker_service import BrokerService
 from app.services.portfolio_service import PortfolioService
 
 router = APIRouter(prefix="/portfolio", tags=["portfolio"])
@@ -24,4 +25,4 @@ def get_summary(db: Session = Depends(get_db)):
 @router.get("/broker-breakdown", response_model=list[PortfolioBrokerBreakdown])
 def get_broker_breakdown(db: Session = Depends(get_db)):
     holdings = db.query(Holding).all()
-    return PortfolioService.broker_breakdown(holdings)
+    return PortfolioService.broker_breakdown(holdings, all_brokers=BrokerService.supported_brokers())

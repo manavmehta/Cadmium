@@ -14,8 +14,8 @@ ASSET_TAX_RULES: dict[str, AssetTaxRule] = {
     "stock": AssetTaxRule(ltcg_days_threshold=365, exemption_eligible=True),
     # Equity ETF treatment aligned with listed equity for this engine
     "etf": AssetTaxRule(ltcg_days_threshold=365, exemption_eligible=True),
-    # Mutual funds tracked separately with distinct holding-period rule
-    "mf": AssetTaxRule(ltcg_days_threshold=1095, exemption_eligible=False),
+    # Mutual funds tracked separately with distinct tax treatment, but LT cutover at 365 days.
+    "mf": AssetTaxRule(ltcg_days_threshold=365, exemption_eligible=True),
 }
 
 

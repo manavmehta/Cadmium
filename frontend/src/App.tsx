@@ -102,10 +102,11 @@ export function App() {
         [broker]: { at: new Date().toISOString(), result: res }
       }));
       setBrokerAction(res.message);
-      if (res.success) {
+      if (res.success || res.price_refresh_success) {
         await loadData();
         await loadBrokerStatus();
-      } else {
+      }
+      if (!res.success) {
         setError(res.message);
       }
     } catch (e) {
@@ -162,6 +163,14 @@ export function App() {
                     Last sync: {syncStatus[b.broker].result.success ? "success" : "failed"} | Data quality:{" "}
                     {syncStatus[b.broker].result.data_quality}
                   </span>
+                  <span>
+                    {" "}
+                    | Lot refresh: {syncStatus[b.broker].result.lot_refresh_success ? "ok" : "failed"} | Price refresh:{" "}
+                    {syncStatus[b.broker].result.price_refresh_success ? "ok" : "failed"}
+                  </span>
+                  {syncStatus[b.broker].result.upstream_error_code ? (
+                    <span> | Upstream: {syncStatus[b.broker].result.upstream_error_code}</span>
+                  ) : null}
                   <span> | Reason: {syncStatus[b.broker].result.message}</span>
                 </div>
               )}
